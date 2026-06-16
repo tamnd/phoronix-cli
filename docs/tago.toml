@@ -1,0 +1,10 @@
+title       = "phoronix"
+baseURL     = "https://phoronix-cli.tamnd.com/"
+description = "Read Phoronix Linux hardware benchmarks and news."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/phoronix-cli"
