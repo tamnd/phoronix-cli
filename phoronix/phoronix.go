@@ -1,62 +1,123 @@
 // Package phoronix is the library behind the phoronix command line:
-// the HTTP client, request shaping, and the typed data models for phoronix.
+// the HTTP client, RSS parser, article HTML parser, and typed data models for
+// phoronix.com.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// Phoronix publishes Linux hardware benchmarks and open-source tech news.
+// The site is behind Cloudflare, but RSS feeds and article pages respond to
+// standard browser User-Agent requests. This package reads the RSS feed for
+// listing and the article HTML for full content.
 package phoronix
 
 import (
 	"context"
+	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to phoronix. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "phoronix/dev (+https://github.com/tamnd/phoronix-cli)"
-
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at phoronix.com; change it once you
-// know the real endpoints you want to read.
-const Host = "phoronix.com"
+// Host is the site this client talks to.
+const Host = "www.phoronix.com"
 
 // BaseURL is the root every request is built from.
 const BaseURL = "https://" + Host
 
-// Client talks to phoronix over HTTP.
-type Client struct {
-	HTTP      *http.Client
-	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
+// DefaultUserAgent is the User-Agent sent with every request. A Firefox on
+// Linux UA is natural for a Linux-focused site and avoids Cloudflare bot
+// classification.
+const DefaultUserAgent = "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0"
 
-	last time.Time
+// ErrBlocked is returned when Cloudflare or another challenge blocks the request.
+var ErrBlocked = errors.New("phoronix: request blocked (Cloudflare challenge)")
+
+// ErrNotFound is returned when a page returns 404.
+var ErrNotFound = errors.New("phoronix: not found")
+
+// Config holds constructor parameters for Client.
+type Config struct {
+	BaseURL   string
+	UserAgent string
+	Rate      time.Duration
+	Retries   int
+	Timeout   time.Duration
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+// DefaultConfig returns sensible defaults for polite scraping.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   BaseURL,
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Rate:      500 * time.Millisecond,
+		Retries:   3,
+		Timeout:   30 * time.Second,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client talks to phoronix.com over HTTP.
+type Client struct {
+	cfg  Config
+	http *http.Client
+	mu   sync.Mutex
+	last time.Time
+}
+
+// NewClient returns a Client configured with cfg.
+func NewClient(cfg Config) *Client {
+	return &Client{
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+// GetRSS fetches the RSS feed for the given category. An empty category string
+// fetches the main feed.
+func (c *Client) GetRSS(ctx context.Context, category string) ([]Article, error) {
+	u := c.cfg.BaseURL + "/rss.php"
+	if category != "" {
+		u += "?category=" + url.QueryEscape(category)
+	}
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	return parseRSS(body, category)
+}
+
+// GetArticle fetches the full content of an article by slug.
+func (c *Client) GetArticle(ctx context.Context, slug string) (*ArticleDetail, error) {
+	u := c.cfg.BaseURL + "/news/" + slug
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	return parseArticle(body, slug, u)
+}
+
+// Search fetches search results from Phoronix for the given query.
+func (c *Client) Search(ctx context.Context, query string, limit int) ([]Article, error) {
+	q := strings.ReplaceAll(query, " ", "+")
+	u := c.cfg.BaseURL + "/search/" + url.PathEscape(q)
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	results := parseSearch(body)
+	if limit > 0 && len(results) > limit {
+		results = results[:limit]
+	}
+	return results, nil
+}
+
+// get fetches url and returns the response body. It paces and retries.
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -64,7 +125,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,23 +134,27 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) ([]byte, bool, error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, false, ErrNotFound
+	}
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
 		return nil, true, fmt.Errorf("http %d", resp.StatusCode)
 	}
@@ -97,19 +162,33 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
 	}
 
-	b, err := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
 		return nil, true, err
+	}
+
+	if isBlocked(b) {
+		return nil, false, ErrBlocked
 	}
 	return b, false, nil
 }
 
-// pace blocks until at least Rate has passed since the previous request.
+// isBlocked detects Cloudflare challenge pages.
+func isBlocked(body []byte) bool {
+	s := string(body)
+	return strings.Contains(s, "Just a moment") ||
+		strings.Contains(s, "Enable JavaScript and cookies") ||
+		strings.Contains(s, "cf-browser-verification")
+}
+
+// pace blocks until at least Rate has passed since the last request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
@@ -123,78 +202,249 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on phoronix.com. It is a stand-in for the typed records you
-// will model from the real phoronix endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `phoronix cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// --- RSS parsing ---
+
+type rssFeed struct {
+	XMLName xml.Name   `xml:"rss"`
+	Channel rssChannel `xml:"channel"`
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
+type rssChannel struct {
+	Items []rssItem `xml:"item"`
 }
 
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
+type rssItem struct {
+	Title   string `xml:"title"`
+	Link    string `xml:"link"`
+	Desc    string `xml:"description"`
+	PubDate string `xml:"pubDate"`
+	Author  string `xml:"author"`
+	GUID    string `xml:"guid"`
+}
+
+func parseRSS(body []byte, category string) ([]Article, error) {
+	var feed rssFeed
+	if err := xml.Unmarshal(body, &feed); err != nil {
+		return nil, fmt.Errorf("parse RSS: %w", err)
 	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
+	out := make([]Article, 0, len(feed.Channel.Items))
+	for _, it := range feed.Channel.Items {
+		slug := slugFromURL(it.Link)
+		pub := parsePubDate(it.PubDate)
+		author := cleanAuthor(it.Author)
+		summary := stripHTMLTags(it.Desc)
+		cat := category
+		if cat == "" {
+			cat = guessCategory(it.Link)
 		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
+		out = append(out, Article{
+			Slug:        slug,
+			Title:       strings.TrimSpace(it.Title),
+			URL:         it.Link,
+			Category:    cat,
+			Summary:     summary,
+			Author:      author,
+			PublishedAt: pub,
+		})
 	}
 	return out, nil
 }
 
+// slugFromURL extracts the last path segment from a Phoronix article URL.
+func slugFromURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Path == "" {
+		return rawURL
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	return parts[len(parts)-1]
+}
+
+// guessCategory reads a rough category from the URL (e.g., /news/ means general).
+func guessCategory(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) > 1 {
+		return parts[0]
+	}
+	return ""
+}
+
+// parsePubDate converts an RSS pubDate string to RFC3339 date.
+func parsePubDate(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	formats := []string{
+		time.RFC1123Z,
+		time.RFC1123,
+		"Mon, 02 Jan 2006 15:04:05 -0700",
+		"Mon, 02 Jan 2006 15:04:05 MST",
+	}
+	for _, f := range formats {
+		if t, err := time.Parse(f, s); err == nil {
+			return t.UTC().Format("2006-01-02")
+		}
+	}
+	return s
+}
+
+// cleanAuthor strips email addresses from author fields (RSS often has "name <email>").
+func cleanAuthor(s string) string {
+	s = strings.TrimSpace(s)
+	// strip "<email>" suffix
+	if idx := strings.Index(s, "<"); idx > 0 {
+		s = strings.TrimSpace(s[:idx])
+	}
+	// if it's just an email, strip it
+	if strings.Contains(s, "@") {
+		return ""
+	}
+	return s
+}
+
+// --- article HTML parsing ---
+
 var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
+	h1RE      = regexp.MustCompile(`(?i)<h1[^>]*>(.*?)</h1>`)
+	titleTagRE = regexp.MustCompile(`(?i)<title[^>]*>(.*?)</title>`)
+	tagRE     = regexp.MustCompile(`(?is)<[^>]+>`)
+	pTagRE    = regexp.MustCompile(`(?is)<p[^>]*>(.*?)</p>`)
+	brRE      = regexp.MustCompile(`(?i)<br\s*/?>`)
+	timeTagRE = regexp.MustCompile(`(?i)<time[^>]*>([^<]+)</time>`)
+	authorRE  = regexp.MustCompile(`(?i)author[^>]*>([^<]+)<`)
 )
 
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
+func parseArticle(body []byte, slug, rawURL string) (*ArticleDetail, error) {
+	s := string(body)
+
+	title := ""
+	if m := h1RE.FindStringSubmatch(s); len(m) > 1 {
+		title = stripHTMLTags(m[1])
+	}
+	if title == "" {
+		if m := titleTagRE.FindStringSubmatch(s); len(m) > 1 {
+			title = stripHTMLTags(m[1])
+			// strip site name suffix
+			if i := strings.Index(title, " | "); i > 0 {
+				title = strings.TrimSpace(title[:i])
+			}
+			if i := strings.Index(title, " - Phoronix"); i > 0 {
+				title = strings.TrimSpace(title[:i])
+			}
 		}
+	}
+
+	pub := ""
+	if m := timeTagRE.FindStringSubmatch(s); len(m) > 1 {
+		pub = parsePubDate(strings.TrimSpace(m[1]))
+	}
+
+	author := ""
+	if m := authorRE.FindStringSubmatch(s); len(m) > 1 {
+		author = strings.TrimSpace(m[1])
+	}
+
+	body2 := extractArticleBody(s)
+
+	return &ArticleDetail{
+		Slug:        slug,
+		Title:       title,
+		URL:         rawURL,
+		Author:      author,
+		PublishedAt: pub,
+		Body:        body2,
+	}, nil
+}
+
+// extractArticleBody extracts the main article text from the HTML.
+func extractArticleBody(s string) string {
+	// Try to find article body div
+	bodyDivRE := regexp.MustCompile(`(?is)<div[^>]+class="[^"]*article[^"]*"[^>]*>(.*?)</div>`)
+	if m := bodyDivRE.FindStringSubmatch(s); len(m) > 1 {
+		text := htmlToText(m[1])
+		if len(text) > 100 {
+			return text
+		}
+	}
+
+	// Fallback: collect all <p> tags with meaningful text
+	var paras []string
+	for _, m := range pTagRE.FindAllStringSubmatch(s, -1) {
+		if len(m) < 2 {
+			continue
+		}
+		text := stripHTMLTags(m[1])
+		text = strings.TrimSpace(text)
+		if len(text) >= 50 {
+			paras = append(paras, text)
+		}
+	}
+	return strings.Join(paras, "\n\n")
+}
+
+// htmlToText converts HTML to plain text with paragraph breaks.
+func htmlToText(s string) string {
+	s = brRE.ReplaceAllString(s, "\n")
+	s = regexp.MustCompile(`(?i)</?p[^>]*>`).ReplaceAllString(s, "\n")
+	s = tagRE.ReplaceAllString(s, "")
+	lines := strings.Split(s, "\n")
+	var out []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	return strings.Join(out, "\n\n")
+}
+
+// stripHTMLTags removes all HTML tags from s and unescapes entities.
+func stripHTMLTags(s string) string {
+	s = tagRE.ReplaceAllString(s, "")
+	s = strings.ReplaceAll(s, "&amp;", "&")
+	s = strings.ReplaceAll(s, "&lt;", "<")
+	s = strings.ReplaceAll(s, "&gt;", ">")
+	s = strings.ReplaceAll(s, "&quot;", `"`)
+	s = strings.ReplaceAll(s, "&#39;", "'")
+	s = strings.ReplaceAll(s, "&nbsp;", " ")
+	return strings.TrimSpace(strings.Join(strings.Fields(s), " "))
+}
+
+// --- search parsing ---
+
+var newsLinkRE = regexp.MustCompile(`(?i)href="(/news/([^"?#]+))"`)
+
+func parseSearch(body []byte) []Article {
+	s := string(body)
+	var out []Article
+	seen := map[string]bool{}
+	for _, m := range newsLinkRE.FindAllStringSubmatch(s, -1) {
+		if len(m) < 3 {
+			continue
+		}
+		slug := m[2]
+		if seen[slug] {
+			continue
+		}
+		seen[slug] = true
+		out = append(out, Article{
+			Slug: slug,
+			URL:  BaseURL + m[1],
+		})
 	}
 	return out
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+// SlugFromInput converts a full Phoronix URL or a bare slug into a slug.
+func SlugFromInput(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "http") {
+		return slugFromURL(s)
 	}
 	return s
 }
